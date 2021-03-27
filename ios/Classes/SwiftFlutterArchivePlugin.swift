@@ -12,6 +12,7 @@ import Flutter
 
 /// https://github.com/weichsel/ZIPFoundation
 import ZIPFoundation
+import SSZipArchive
 
 enum ExtractOperation: String {
   case extract
@@ -217,71 +218,55 @@ public class SwiftFlutterArchivePlugin: NSObject, FlutterPlugin {
   /// - Throws: Throws an error if the source item does not exist or the destination URL is not writable.
   private func unzipItemAndReportProgress(at sourceURL: URL, to destinationURL: URL, jobId: Int, skipCRC32: Bool = false,
                                           preferredEncoding: String.Encoding? = nil) throws {
-    // based on https://github.com/weichsel/ZIPFoundation/blob/development/Sources/ZIPFoundation/FileManager%2BZIP.swift
+    
     guard itemExists(at: sourceURL) else {
       throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: sourceURL.path])
     }
-    guard let archive = Archive(url: sourceURL, accessMode: .read, preferredEncoding: preferredEncoding) else {
-      throw Archive.ArchiveError.unreadableArchive
-    }
-    // Defer extraction of symlinks until all files & directories have been created.
-    // This is necessary because we can't create links to files that haven't been created yet.
-    let sortedEntries = archive.sorted { (left, right) -> Bool in
-      switch (left.type, right.type) {
-      case (.directory, .file): return true
-      case (.directory, .symlink): return true
-      case (.file, .symlink): return true
-      default: return false
-      }
-    }
-
-    let totalEntriesCount = Double(sortedEntries.count)
-    var currentEntryIndex: Double = 0
 
     let dispatchGroup = DispatchGroup()
-    for entry in sortedEntries {
-      let path = preferredEncoding == nil ? entry.path : entry.path(using: preferredEncoding!)
-      let destinationEntryURL = destinationURL.appendingPathComponent(path)
+    let success = SSZipArchive.unzipFile(atPath: sourceURL.path,
+                                                   toDestination: destinationURL.path,
+                                                   preserveAttributes: true,
+                                                   overwrite: true,
+                                                   nestedZipLevel: 1,
+                                                   password: nil,
+                                                   error: nil,
+                                                   delegate: nil,
+                                                   progressHandler: {
+            (entry, zipInfo, readByte, totalByte) -> Void in
 
-      var entryDic = entryToDictionary(entry: entry)
-      let progress: Double = currentEntryIndex / totalEntriesCount * 100.0
-      entryDic["jobId"] = jobId
-      entryDic["progress"] = progress
-      var extractOperation: ExtractOperation?
-      dispatchGroup.enter()
-      DispatchQueue.main.async {
-        self.channel.invokeMethod("progress", arguments: entryDic) {
-          (result: Any?) -> Void in
-          if let error = result as? FlutterError {
-            self.log("failed: \(error)")
-            extractOperation = ExtractOperation.extract
-          } else if FlutterMethodNotImplemented.isEqual(result) {
-            self.log("not implemented")
-            extractOperation = ExtractOperation.extract
-          } else {
-            extractOperation = ExtractOperation(rawValue: result as! String)
-            self.log("result: \(String(describing: extractOperation))")
-          }
-          dispatchGroup.leave()
-        }
-      }
+            var entryDic = self.entryToDictionary(entry: entry)
+            let progress = readByte / totalByte * 100
+            entryDic["jobId"] = jobId
+            entryDic["progress"] = progress
+            var extractOperation: ExtractOperation?
 
-      currentEntryIndex += 1
+            //Asynchrone task
+            dispatchGroup.enter()
+            DispatchQueue.main.async {
+              self.channel.invokeMethod("progress", arguments: entryDic) {
+                (result: Any?) -> Void in
+                if let error = result as? FlutterError {
+                  self.log("failed: \(error)")
+                  extractOperation = ExtractOperation.extract
+                } else if FlutterMethodNotImplemented.isEqual(result) {
+                  self.log("not implemented")
+                  extractOperation = ExtractOperation.extract
+                } else {
+                  extractOperation = ExtractOperation(rawValue: result as! String)
+                  self.log("result: \(String(describing: extractOperation))")
+                }
+                dispatchGroup.leave()
+              }
+            }
+            },
+                                                   completionHandler: nil)
 
-      log("Waiting...")
-      dispatchGroup.wait()
-      log("..waiting")
-      if extractOperation == ExtractOperation.skip {
-        continue
-      } else if extractOperation == ExtractOperation.cancel {
-        break
-      }
-
-      guard destinationEntryURL.isContained(in: destinationURL) else {
-        throw CocoaError(.fileReadInvalidFileName,
-                         userInfo: [NSFilePathErrorKey: destinationEntryURL.path])
-      }
-      _ = try archive.extract(entry, to: destinationEntryURL, skipCRC32: skipCRC32)
+    if success != false {
+      self.log("Success unzip")
+    } else {
+        self.log("No success unzip")
+        return
     }
   }
 
@@ -303,17 +288,9 @@ public class SwiftFlutterArchivePlugin: NSObject, FlutterPlugin {
     NSLog("\n" + message)
   }
 
-  private func entryToDictionary(entry: Entry) -> [String: Any] {
-    let date = entry.fileAttributes[FileAttributeKey.modificationDate] as? Date
-    let millis = Int(date?.timeIntervalSince1970 ?? 0) * 1000
+  private func entryToDictionary(entry: String) -> [String: Any] {
     let dic: [String: Any] = [
-      "name": entry.path,
-      "isDirectory": entry.type == Entry.EntryType.directory,
-      "modificationDate": millis,
-      "uncompressedSize": entry.uncompressedSize,
-      "compressedSize": entry.compressedSize,
-      "crc": entry.checksum,
-      "compressionMethod": entry.compressedSize != entry.uncompressedSize ? "deflated" : "none"
+      "name": entry,
     ]
     return dic
   }
